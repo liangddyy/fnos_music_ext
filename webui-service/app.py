@@ -79,6 +79,7 @@ from proxy.quality_policy import (  # noqa: E402
 from proxy.version import read_release_channel, ui_version
 from proxy.userstorage import (  # noqa: E402
     merge_user_map,
+    normalize_account_users,
     parse_user_map,
     validate_effective_roots,
 )
@@ -256,6 +257,8 @@ SCHEMA: dict[str, dict] = {
     "FNMUSIC_SEARCH_DEEP_MAX_PAGES": {"kind": "int", "default": "10", "min": 1, "max": 50, "group": "search", "reload": "hot", "label": "深分页页数上限"},
     "FNMUSIC_WEB_SEARCH_RESULT_LIMIT": {"kind": "int", "default": "50", "min": 1, "max": 200, "strict": True, "group": "search", "reload": "hot", "label": "Web 搜索结果数量"},
     "FNMUSIC_NETEASE_MY_PLAYLISTS": {"kind": "bool", "default": "false", "group": "source", "reload": "hot", "label": "网易账号歌单"},
+    "FNMUSIC_NETEASE_PLAYLIST_SCOPE": {"kind": "enum", "values": ["all", "selected"], "default": "all", "group": "source", "reload": "hot", "label": "网易歌单同步范围"},
+    "FNMUSIC_NETEASE_PLAYLIST_USERS": {"kind": "str", "default": "[]", "group": "source", "reload": "hot", "label": "网易歌单同步账户"},
     "FNMUSIC_NETEASE_PLAYLIST_RESIDENT": {"kind": "bool", "default": "false", "group": "source", "reload": "hot", "label": "网易云歌单常驻"},
 }
 
@@ -1096,6 +1099,8 @@ def _normalize_lx_source_order(raw) -> str:
 
 
 def _normalize_value(key: str, raw) -> str:
+    if key == "FNMUSIC_NETEASE_PLAYLIST_USERS":
+        return json.dumps(normalize_account_users(raw), ensure_ascii=False, separators=(",", ":"))
     if key == "LX_SOURCE_LIST":
         return _normalize_lx_source_list(raw)
     if key == "FNMUSIC_LX_SOURCE_ORDER":

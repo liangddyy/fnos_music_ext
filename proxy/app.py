@@ -347,6 +347,8 @@ CONF = {
     # 网易账号歌单注入（2.6.0）：默认关；需网易盒子启用并扫码登录，
     # 音乐页在热门推荐与官方歌单之间展示账号自建歌单（只读，不回写网易）
     "netease_my_playlists": os.environ.get("FNMUSIC_NETEASE_MY_PLAYLISTS", "false").lower() in ("true", "1", "yes"),
+    "netease_playlist_scope": os.environ.get("FNMUSIC_NETEASE_PLAYLIST_SCOPE", "all").strip(),
+    "netease_playlist_users": os.environ.get("FNMUSIC_NETEASE_PLAYLIST_USERS", "[]"),
     # 网易云歌单常驻（issue #38）：默认关；勾选后即使当前音源不是网易盒子，
     # 网易账号歌单仍注入且其曲目可播放（musicbox 进程由 webui 对账常驻保活）。
     # 只放宽歌单/播放链路；搜索仍仅在网易盒子为当前音源时使用网易结果
@@ -715,6 +717,8 @@ _ENV_WATCH_KEYS: dict[str, tuple[str, str]] = {
     "FNMUSIC_PUBLIC_PLAYLISTS_SELECTION": ("public_playlists_selection", "str"),
     "FNMUSIC_PUBLIC_PLAYLISTS_BY_USER": ("public_playlists_by_user", "str"),
     "FNMUSIC_NETEASE_MY_PLAYLISTS": ("netease_my_playlists", "bool"),
+    "FNMUSIC_NETEASE_PLAYLIST_SCOPE": ("netease_playlist_scope", "str"),
+    "FNMUSIC_NETEASE_PLAYLIST_USERS": ("netease_playlist_users", "str"),
     "FNMUSIC_NETEASE_PLAYLIST_RESIDENT": ("netease_playlist_resident", "bool"),
     "FNMUSIC_COVER_DIR": ("cover_dir", "str"),
     "FNMUSIC_COVER_ENRICH": ("cover_enrich", "bool"),
@@ -12235,6 +12239,23 @@ async def _playlist_cover_response(request: Request, guid: str, tracks: list,
     return _placeholder_cover_response(guid)
 
 
+def _netease_account_playlists_allowed(user_guid: str) -> bool:
+    return (bool(CONF.get("netease_my_playlists")) and _netease_runtime_usable()
+            and nmpl.account_scope_allows(CONF, user_guid))
+
+
+async def _netease_playlist_access_error(request: Request) -> Response | None:
+    is_authed, user_guid, auth_resp = await _probe_upstream_auth(request, get_upstream_client(request.app))
+    if not is_authed:
+        response = auth_resp or JSONResponse(content={"code": -1, "msg": "unauthorized", "data": None}, status_code=401)
+    elif not _netease_account_playlists_allowed(user_guid):
+        response = JSONResponse(content={"code": -1, "msg": "playlist not found", "data": None})
+    else:
+        return None
+    response.headers["Cache-Control"] = "private, no-store"
+    return response
+
+
 def _public_playlist_allowed(user_guid: str, entry: dict | None) -> bool:
     """已订阅歌单保持原口径；搜索发现的歌单只对当前用户、且来源仍启用时放行。"""
     if not entry:
@@ -12295,11 +12316,16 @@ async def static_cover(request: Request, subpath: str = ""):
     nm_pl_id = nmpl.playlist_id_from_cover_request(guid, request.query_params.get("coverId") or subpath)
     if nm_pl_id:
         upstream_client = get_upstream_client(request.app)
-        is_authed, _user_guid, auth_resp = await _probe_upstream_auth(request, upstream_client)
+        is_authed, user_guid, auth_resp = await _probe_upstream_auth(request, upstream_client)
         if not is_authed and auth_resp is not None:
+            auth_resp.headers["Cache-Control"] = "private, no-store"
             return auth_resp
-        return await _playlist_cover_response(
+        if not is_authed or not _netease_account_playlists_allowed(user_guid):
+            return Response(status_code=404, headers={"Cache-Control": "private, no-store"})
+        response = await _playlist_cover_response(
             request, guid, nmpl.cached_tracks(nm_pl_id) or [], nmpl.cover_url_for(nm_pl_id))
+        response.headers["Cache-Control"] = "private, no-store"
+        return response
     if not is_online_guid(guid):
         local_resp = _official_cover_file_response(guid, size=request.query_params.get("size"))
         if local_resp is not None:
@@ -13365,6 +13391,9 @@ async def playlist_add_track(request: Request):
         return JSONResponse(content={"code": 0, "msg": "", "data": None})
     if nmpl.is_nm_playlist_guid(playlist_guid):
         # 网易账号歌单只读（不回写网易）：同样吸收请求
+        error = await _netease_playlist_access_error(request)
+        if error is not None:
+            return error
         return JSONResponse(content={"code": 0, "msg": "", "data": None})
 
     online = [g for g in (resolve_real_guid(g) for g in track_guids) if is_online_guid(g)]
@@ -13442,6 +13471,9 @@ async def playlist_remove_track(request: Request):
     if dailyrec.is_recommend_playlist_guid(playlist_guid):
         return JSONResponse(content={"code": 0, "msg": "", "data": None})
     if nmpl.is_nm_playlist_guid(playlist_guid):
+        error = await _netease_playlist_access_error(request)
+        if error is not None:
+            return error
         return JSONResponse(content={"code": 0, "msg": "", "data": None})
 
     online = [g for g in (resolve_real_guid(g) for g in track_guids) if is_online_guid(g)]
@@ -13500,6 +13532,9 @@ async def playlist_delete(request: Request):
         return JSONResponse(content={"code": 0, "msg": "ok", "data": None})
     if nmpl.is_nm_playlist_guid(resolve_real_guid(_pl_guid)):
         # 网易账号歌单只读：吸收删除（不透传官方必被拒的假 id），下次刷新卡片仍在
+        error = await _netease_playlist_access_error(request)
+        if error is not None:
+            return error
         return JSONResponse(content={"code": 0, "msg": "ok", "data": None})
     envelope = await fetch_upstream_envelope(request, upstream_client)
     if isinstance(envelope, Response):
@@ -13560,9 +13595,8 @@ async def playlist_list(request: Request):
         return auth_resp or JSONResponse(content=envelope, headers=headers)
 
     kinds = _recommend_injectable_kinds(user_guid)
-    # 网易账号歌单：实例级内容（同热门推荐），shared 会话同样可见；
-    # 网易云歌单常驻生效时即使当前音源不是网易盒子也注入（issue #38）
-    nm_on = bool(CONF.get("netease_my_playlists")) and _netease_runtime_usable()
+    headers["Cache-Control"] = "private, no-store"
+    nm_on = _netease_account_playlists_allowed(user_guid)
     public_on = bool(CONF.get("public_playlists_enabled"))
     if not kinds and not nm_on and not public_on:
         # 两个推荐开关全关（或 shared 会话无任何可注入类型）且账号歌单关闭：不注入
@@ -13681,14 +13715,17 @@ async def playlist_detail(request: Request):
     if nm_pl_id:
         # 网易账号歌单：只读虚拟歌单，卡片从摘要（内存→磁盘）取；trackCount 用
         # 已缓存曲目数更准（可播过滤后可能少于网易侧计数）
+        error = await _netease_playlist_access_error(request)
+        if error is not None:
+            return error
         card = nmpl.card_for(nm_pl_id)
         if card is None:
-            return JSONResponse(content={"code": -1, "msg": "playlist not found", "data": None})
+            return JSONResponse(content={"code": -1, "msg": "playlist not found", "data": None}, headers={"Cache-Control": "private, no-store"})
         tracks = nmpl.cached_tracks(nm_pl_id)
         if tracks is not None:
             card = {**card, "trackCount": len(tracks)}
         card = _align_playlist_card_guid(card, raw_guid)
-        return JSONResponse(content={"code": 0, "msg": "ok", "data": card})
+        return JSONResponse(content={"code": 0, "msg": "ok", "data": card}, headers={"Cache-Control": "private, no-store"})
     kind = dailyrec.online_playlist_kind(guid)
     if not kind:
         # 官方歌单：本地存在在线附加条目才拦截修正 trackCount，否则纯透传
@@ -13798,7 +13835,7 @@ async def playlist_batch_detail(request: Request):
         rec = _playlist_public_fields(bundle.get("playlist") or {}, bundle.get("tracks") or [])
         rec["trackCount"] = len(bundle.get("tracks") or [])
         recs.append(_align_playlist_card_guid(rec, requested_by_real.get(g, g)))
-    for pid in nm_ids:
+    for pid in nm_ids if is_authed and _netease_account_playlists_allowed(user_guid) else []:
         card = nmpl.card_for(pid)
         if card is not None:
             tracks = nmpl.cached_tracks(pid)
@@ -13820,6 +13857,7 @@ async def playlist_batch_detail(request: Request):
                 card = {**card, "trackCount": len(tracks)}
             recs.append(_align_playlist_card_guid(card, requested_by_real.get(g, g)))
     response = JSONResponse(content={"code": 0, "msg": "ok", "data": {"list": recs + official_list}})
+    response.headers["Cache-Control"] = "private, no-store"
     for bundle in consumed_liked:
         _mark_liked_response_fetched(user_guid, bundle)
     return response
@@ -13882,7 +13920,10 @@ async def playlist_track_list(request: Request):
         upstream_client = get_upstream_client(request.app)
         is_authed, user_guid, auth_resp = await _probe_upstream_auth(request, upstream_client)
         if not is_authed and auth_resp is not None:
+            auth_resp.headers["Cache-Control"] = "private, no-store"
             return auth_resp
+        if not is_authed or not _netease_account_playlists_allowed(user_guid):
+            return JSONResponse(content={"code": -1, "msg": "playlist not found", "data": None}, headers={"Cache-Control": "private, no-store"})
         tracks = dailyrec.stamp_playlist_tracks(
             await nmpl.load_tracks(get_netease_client(request.app), nm_pl_id, build_online_track)
         )
@@ -13909,7 +13950,8 @@ async def playlist_track_list(request: Request):
                 "code": 0,
                 "msg": "ok",
                 "data": {"list": page_tracks, "total": len(tracks), "sort": request.query_params.get("sort") or ""},
-            })
+            }),
+            headers={"Cache-Control": "private, no-store"},
         )
     if not kind:
         # 官方歌单：本地存在在线附加条目才拦截合并，否则纯透传

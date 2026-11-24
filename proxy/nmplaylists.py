@@ -11,8 +11,8 @@
 （{"playlist": ..., "tracks": [...]} / {"items": [...]}），重启后由
 ensure_registry_warm 扫描 nm_playlists_cache 顺带重建 fake→real 反查映射。
 
-网易登录是实例级账号：所有 fnOS 用户看到同一批歌单（同热门推荐，无按用户
-隔离）；在音乐页对这类歌单加歌 / 移歌 / 删除均被 proxy 只读吸收，不回写网易。
+网易登录与缓存为实例级共享，歌单出口按配置限制可访问的飞牛账户；
+在音乐页对这类歌单加歌 / 移歌 / 删除均被 proxy 只读吸收，不回写网易。
 """
 from __future__ import annotations
 
@@ -29,8 +29,10 @@ import httpx
 
 try:
     from . import recommend as dailyrec
+    from .userstorage import normalize_account_users
 except ImportError:  # uvicorn --app-dir proxy
     import recommend as dailyrec  # type: ignore
+    from userstorage import normalize_account_users
 
 logger = logging.getLogger("proxy.nmplaylists")
 
@@ -60,6 +62,18 @@ _prefetch_tasks: "set[asyncio.Task]" = set()
 _cover_urls: "dict[int, str]" = {}
 _disk_cards: "list | None" = None     # 磁盘摘要（懒加载，进程内缓存）
 _persist_last: "dict[str, float]" = {}
+
+
+def account_scope_allows(conf: dict, user_guid: str) -> bool:
+    scope = conf.get("netease_playlist_scope", "all")
+    if scope == "all":
+        return True
+    if scope != "selected" or not user_guid or user_guid == "shared":
+        return False
+    try:
+        return user_guid in normalize_account_users(conf.get("netease_playlist_users", "[]"))
+    except (ValueError, TypeError):
+        return False
 
 
 def home_dir() -> str:

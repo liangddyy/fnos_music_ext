@@ -6,7 +6,10 @@ import ast
 import configparser
 import os
 import re
+import shlex
+import shutil
 import subprocess
+import sys
 import textwrap
 from pathlib import Path
 
@@ -15,6 +18,24 @@ import yaml
 
 CONTAINER_DIR = Path(__file__).resolve().parent
 REPO_ROOT = CONTAINER_DIR.parent
+
+
+def test_webui_imports_with_only_container_proxy_modules(tmp_path):
+    dockerfile = (CONTAINER_DIR / "Dockerfile").read_text(encoding="utf-8").replace("\\\n", " ")
+    for line in dockerfile.splitlines():
+        if not line.startswith("COPY "):
+            continue
+        for source in shlex.split(line)[1:-1]:
+            if source.startswith("proxy/") and source.endswith(".py"):
+                target = tmp_path / source
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(REPO_ROOT / source, target)
+    shutil.copytree(REPO_ROOT / "webui-service", tmp_path / "webui-service",
+                    ignore=shutil.ignore_patterns("test_*", "__pycache__"))
+    script = "import runpy,sys; sys.path.insert(0,'webui-service'); runpy.run_path('webui-service/app.py')"
+    result = subprocess.run([sys.executable, "-I", "-c", script], cwd=tmp_path,
+                            capture_output=True, text=True, encoding="utf-8", timeout=30)
+    assert result.returncode == 0, result.stderr
 
 
 @pytest.fixture(scope="module")

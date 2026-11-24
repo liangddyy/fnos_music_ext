@@ -96,6 +96,8 @@ def setup_nm_env(tmp_path, monkeypatch):
     monkeypatch.setitem(CONF, "cache_dir", str(tmp_path / "cache"))
     monkeypatch.setitem(CONF, "netease_enabled", True)
     monkeypatch.setitem(CONF, "netease_my_playlists", True)
+    monkeypatch.setitem(CONF, "netease_playlist_scope", "all")
+    monkeypatch.setitem(CONF, "netease_playlist_users", "[]")
     # 关闭推荐注入，聚焦 nm 歌单行为（注入位置断言不依赖推荐构建链）
     monkeypatch.setitem(CONF, "recommend_hot", False)
     monkeypatch.setitem(CONF, "recommend_daily", False)
@@ -145,6 +147,158 @@ def test_toggle_off_no_injection():
         assert mb.state["calls"] == 0
     finally:
         CONF["netease_my_playlists"] = True
+
+
+@pytest.mark.parametrize("scope,users,visible", [
+    ("all", "[]", True),
+    ("selected", '["user-nm-1","another-user"]', True),
+    ("selected", '["another-user"]', False),
+    ("selected", "[]", False),
+    ("selected", "broken", False),
+    ("selected", '{"user-nm-1":true}', False),
+    ("selected", '["user-nm-1",123]', False),
+    ("selected", '["user-nm-1",""]', False),
+    ("unknown", '["user-nm-1"]', False),
+])
+def test_account_scope_filters_list_before_fetch(monkeypatch, scope, users, visible):
+    musicbox = _wire(_musicbox_handler(rows=PLAYLIST_ROWS, tracks=TRACK_ROWS))
+    monkeypatch.setitem(CONF, "netease_playlist_scope", scope)
+    monkeypatch.setitem(CONF, "netease_playlist_users", users)
+    with TestClient(app) as client:
+        response = client.get("/music/api/v1/playlist/list")
+    cards = response.json()["data"]["list"]
+    assert any(card["guid"].startswith(nmpl.NM_GUID_PREFIX) for card in cards) is visible
+    assert musicbox.state["calls"] == int(visible)
+
+
+@pytest.mark.parametrize("endpoint", ["detail", "batch-detail", "tracks", "cover"])
+@pytest.mark.parametrize("disguised", [False, True])
+def test_revoked_account_cannot_read_warm_playlist_cache(monkeypatch, endpoint, disguised):
+    _wire(_musicbox_handler(rows=PLAYLIST_ROWS, tracks=TRACK_ROWS))
+    monkeypatch.setattr(proxy_app, "_COVER_FETCH_ASYNC_TRANSPORT", httpx.MockTransport(
+        lambda request: httpx.Response(200, content=b"\xff\xd8\xffnm", headers={"content-type": "image/jpeg"})))
+    guid = nmpl.nm_playlist_guid(111)
+    monkeypatch.setitem(CONF, "netease_playlist_scope", "selected")
+    monkeypatch.setitem(CONF, "netease_playlist_users", '["user-nm-1"]')
+    with TestClient(app) as client:
+        client.get("/music/api/v1/playlist/list")
+        client.get("/music/api/v1/track/playlist-detail/list", params={"guid": guid})
+        requested = fake_official_guid(guid) if disguised else guid
+        monkeypatch.setitem(CONF, "netease_playlist_scope", "selected")
+        monkeypatch.setitem(CONF, "netease_playlist_users", '["another-user"]')
+        if endpoint == "cover":
+            response = client.get("/music/api/v1/static/cover", params={"coverId": f"track_{requested}" if disguised else requested})
+            assert response.status_code == 404
+        elif endpoint == "tracks":
+            monkeypatch.setattr(nmpl, "load_tracks", lambda *args: pytest.fail("unauthorized source fetch"))
+            response = client.get("/music/api/v1/track/playlist-detail/list", params={"guid": requested})
+            assert response.json()["code"] == -1
+        elif endpoint == "batch-detail":
+            response = client.get("/music/api/v1/playlist/batch-detail", params={"guids": f"{requested},localpl"})
+            assert [card["guid"] for card in response.json()["data"]["list"]] == ["localpl"]
+        else:
+            response = client.get("/music/api/v1/playlist/detail", params={"guid": requested})
+            assert response.json()["code"] == -1
+        assert response.headers["cache-control"] == "private, no-store"
+
+
+@pytest.mark.parametrize("guid", ["shared", ""])
+def test_selected_scope_rejects_uncertain_identity(monkeypatch, guid):
+    musicbox = _wire(_musicbox_handler(rows=PLAYLIST_ROWS))
+    app.state.upstream_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(_auth_upstream(guid)), base_url="http://unix")
+    monkeypatch.setitem(CONF, "netease_playlist_scope", "selected")
+    monkeypatch.setitem(CONF, "netease_playlist_users", json.dumps([guid]))
+    with TestClient(app) as client:
+        cards = client.get("/music/api/v1/playlist/list").json()["data"]["list"]
+    assert [card["guid"] for card in cards] == ["localpl"]
+    assert musicbox.state["calls"] == 0
+
+
+def test_account_scope_missing_preserves_legacy_shared_access(monkeypatch):
+    _wire(_musicbox_handler(rows=PLAYLIST_ROWS))
+    monkeypatch.delitem(CONF, "netease_playlist_scope")
+    monkeypatch.delitem(CONF, "netease_playlist_users")
+    app.state.upstream_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(_auth_upstream("shared")), base_url="http://unix")
+    with TestClient(app) as client:
+        cards = client.get("/music/api/v1/playlist/list").json()["data"]["list"]
+    assert len(cards) == 3
+
+
+def test_account_scope_hot_reload_revokes_cached_access(tmp_path, monkeypatch):
+    _wire(_musicbox_handler(rows=PLAYLIST_ROWS, tracks=TRACK_ROWS))
+    for key in ("FNMUSIC_NETEASE_PLAYLIST_SCOPE", "FNMUSIC_NETEASE_PLAYLIST_USERS"):
+        monkeypatch.setenv(key, "")
+    env_path = tmp_path / ".env"
+    env_path.write_text('FNMUSIC_NETEASE_PLAYLIST_SCOPE=selected\nFNMUSIC_NETEASE_PLAYLIST_USERS=["user-nm-1"]\n', encoding="utf-8")
+    changed = proxy_app.apply_env_hot_reload(str(env_path))
+    assert "netease_playlist_scope" in changed
+    assert "netease_playlist_users" in changed
+    with TestClient(app) as client:
+        assert len(client.get("/music/api/v1/playlist/list").json()["data"]["list"]) == 3
+        env_path.write_text('FNMUSIC_NETEASE_PLAYLIST_USERS=[]\n', encoding="utf-8")
+        proxy_app.apply_env_hot_reload(str(env_path))
+        response = client.get("/music/api/v1/playlist/detail", params={"guid": nmpl.nm_playlist_guid(111)})
+        assert response.json()["code"] == -1
+
+
+@pytest.mark.parametrize("status", [401, 500])
+@pytest.mark.parametrize("endpoint", ["detail", "batch-detail", "tracks", "cover"])
+def test_account_scope_auth_failure_cannot_read_cache(monkeypatch, status, endpoint):
+    _wire(_musicbox_handler(rows=PLAYLIST_ROWS, tracks=TRACK_ROWS))
+    with TestClient(app) as client:
+        client.get("/music/api/v1/playlist/list")
+        monkeypatch.setitem(CONF, "netease_playlist_scope", "selected")
+        monkeypatch.setitem(CONF, "netease_playlist_users", '["user-nm-1"]')
+        app.state.upstream_client = httpx.AsyncClient(transport=httpx.MockTransport(
+            lambda request: httpx.Response(status, json={"code": -1})), base_url="http://unix")
+        guid = nmpl.nm_playlist_guid(111)
+        if endpoint == "cover":
+            response = client.get("/music/api/v1/static/cover", params={"coverId": guid})
+        elif endpoint == "tracks":
+            response = client.get("/music/api/v1/track/playlist-detail/list", params={"guid": guid})
+        else:
+            response = client.get(f"/music/api/v1/playlist/{endpoint}", params={"guid": guid})
+        if status == 401:
+            assert response.status_code == 401
+        elif endpoint == "cover":
+            assert response.status_code == 404
+        elif endpoint == "batch-detail":
+            assert response.json()["data"]["list"] == []
+        else:
+            assert response.json()["code"] == -1
+
+
+@pytest.mark.parametrize("allowed", [True, False])
+def test_account_scope_readonly_writes_never_forward(monkeypatch, allowed):
+    _wire(_musicbox_handler(rows=PLAYLIST_ROWS))
+    monkeypatch.setitem(CONF, "netease_playlist_scope", "selected")
+    monkeypatch.setitem(CONF, "netease_playlist_users", '["user-nm-1"]' if allowed else "[]")
+
+    def upstream(request):
+        assert request.url.path.endswith("/user/me")
+        return _auth_upstream()(request)
+
+    app.state.upstream_client = httpx.AsyncClient(transport=httpx.MockTransport(upstream), base_url="http://unix")
+    with TestClient(app) as client:
+        for operation in ("add-track", "remove-track", "delete"):
+            response = client.post(f"/music/api/v1/playlist/{operation}", json={
+                "guid": fake_official_guid(nmpl.nm_playlist_guid(111)), "trackGUIDs": ["online:netease:101"]})
+            assert response.json()["code"] == (0 if allowed else -1)
+
+
+def test_account_scope_resident_does_not_bypass_selection(monkeypatch):
+    musicbox = _wire(_musicbox_handler(rows=PLAYLIST_ROWS))
+    monkeypatch.setitem(CONF, "netease_enabled", False)
+    monkeypatch.setitem(CONF, "netease_playlist_resident", True)
+    monkeypatch.setitem(CONF, "netease_playlist_scope", "selected")
+    monkeypatch.setitem(CONF, "netease_playlist_users", "[]")
+    with TestClient(app) as client:
+        cards = client.get("/music/api/v1/playlist/list").json()["data"]["list"]
+    assert [card["guid"] for card in cards] == ["localpl"]
+    assert musicbox.state["calls"] == 0
+    assert proxy_app._source_enabled("online:netease:101") is True
 
 
 def test_source_disabled_no_injection():

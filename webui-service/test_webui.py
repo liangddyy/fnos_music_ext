@@ -700,6 +700,46 @@ def test_lyric_auto_dl_default_false_and_roundtrip(env_file):
         assert again.json()["values"]["FNMUSIC_LYRIC_AUTO_DL"] == "true"
 
 
+def test_netease_playlist_accounts_defaults_and_roundtrip(env_file):
+    with authed_client() as client:
+        values = client.get("/api/config").json()["values"]
+        assert values["FNMUSIC_NETEASE_PLAYLIST_SCOPE"] == "all"
+        assert values["FNMUSIC_NETEASE_PLAYLIST_USERS"] == "[]"
+        saved = client.put("/api/config", json={"values": {
+            "FNMUSIC_NETEASE_PLAYLIST_SCOPE": "selected",
+            "FNMUSIC_NETEASE_PLAYLIST_USERS": ["user-a", "user-b", "user-a"],
+        }})
+        assert saved.status_code == 200
+        values = client.get("/api/config").json()["values"]
+        assert values["FNMUSIC_NETEASE_PLAYLIST_SCOPE"] == "selected"
+        assert json.loads(values["FNMUSIC_NETEASE_PLAYLIST_USERS"]) == ["user-a", "user-b"]
+
+
+@pytest.mark.parametrize("users", ["broken", "{}", [123], [""], ["shared"], ["bad\nguid"], ["x" * 257], None])
+def test_netease_playlist_accounts_invalid_save_is_atomic(env_file, users):
+    before = env_file.read_bytes()
+    with authed_client() as client:
+        response = client.put("/api/config", json={"values": {
+            "FNMUSIC_NETEASE_PLAYLIST_SCOPE": "selected",
+            "FNMUSIC_NETEASE_PLAYLIST_USERS": users,
+        }})
+        assert response.status_code == 400
+    assert env_file.read_bytes() == before
+
+
+def test_netease_playlist_accounts_empty_selected_and_invalid_scope(env_file):
+    with authed_client() as client:
+        response = client.put("/api/config", json={"values": {
+            "FNMUSIC_NETEASE_PLAYLIST_SCOPE": "selected",
+            "FNMUSIC_NETEASE_PLAYLIST_USERS": "[]",
+        }})
+        assert response.status_code == 200
+        before = env_file.read_bytes()
+        response = client.put("/api/config", json={"values": {"FNMUSIC_NETEASE_PLAYLIST_SCOPE": "invalid"}})
+        assert response.status_code == 400
+        assert env_file.read_bytes() == before
+
+
 # ------------------------------------------------------------------ 大模型用途与猜你喜欢参数 ---
 
 LLM_FLAGS = ("FNMUSIC_LLM_LIKED_ENABLED", "FNMUSIC_LLM_DAILY_ENABLED")

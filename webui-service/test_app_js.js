@@ -865,6 +865,66 @@ test("网易账号歌单开关：loadConfig 回填 + collectConfig 收集", asyn
   assert.strictEqual(els.get("#netease-my-playlists").checked, false);
 });
 
+test("网易账号歌单账户范围：回填、多选与切回全部时保留选择", async () => {
+  reset();
+  enqueue("/app/fnmusic-ext/api/config", {
+    schema: { FNMUSIC_NETEASE_PLAYLIST_SCOPE: {}, FNMUSIC_NETEASE_PLAYLIST_USERS: {} },
+    values: {
+      FNMUSIC_NETEASE_MY_PLAYLISTS: "true",
+      FNMUSIC_NETEASE_PLAYLIST_SCOPE: "selected",
+      FNMUSIC_NETEASE_PLAYLIST_USERS: '["user-a"]',
+    },
+  });
+  enqueue("/app/fnmusic-ext/api/maintenance/music-users", { ok: true, users: [
+    { guid: "user-a", name: "<管理员>", role: "admin" }, { guid: "user-b", name: "家庭成员" },
+  ] });
+  await global.loadConfig();
+  assert.strictEqual(els.get("#netease-playlist-scope").value, "selected");
+  assert.strictEqual(els.get("#netease-playlist-accounts").hidden, false);
+  const choices = els.get("#netease-playlist-users")._children;
+  assert.strictEqual(choices.length, 2);
+  assert.strictEqual(choices[0]._children[0].checked, true);
+  const second = choices[1]._children[0];
+  second.checked = true;
+  await second.dispatch("change");
+  assert.deepStrictEqual(JSON.parse(global.collectConfig().FNMUSIC_NETEASE_PLAYLIST_USERS), ["user-a", "user-b"]);
+  els.get("#netease-playlist-scope").value = "all";
+  await els.get("#netease-playlist-scope").dispatch("change");
+  assert.strictEqual(els.get("#netease-playlist-accounts").hidden, true);
+  assert.strictEqual(global.collectConfig().FNMUSIC_NETEASE_PLAYLIST_SCOPE, "all");
+  assert.deepStrictEqual(JSON.parse(global.collectConfig().FNMUSIC_NETEASE_PLAYLIST_USERS), ["user-a", "user-b"]);
+});
+
+test("网易账号歌单账户范围：读取失败保留选择且不退回全部账户", async () => {
+  reset();
+  enqueue("/app/fnmusic-ext/api/config", {
+    schema: { FNMUSIC_NETEASE_PLAYLIST_SCOPE: {}, FNMUSIC_NETEASE_PLAYLIST_USERS: {} },
+    values: { FNMUSIC_NETEASE_MY_PLAYLISTS: "true", FNMUSIC_NETEASE_PLAYLIST_SCOPE: "selected",
+      FNMUSIC_NETEASE_PLAYLIST_USERS: '["saved-user"]' },
+  });
+  enqueue("/app/fnmusic-ext/api/maintenance/music-users", new Error("offline"));
+  await global.loadConfig();
+  assert.strictEqual(global.collectConfig().FNMUSIC_NETEASE_PLAYLIST_SCOPE, "selected");
+  assert.deepStrictEqual(JSON.parse(global.collectConfig().FNMUSIC_NETEASE_PLAYLIST_USERS), ["saved-user"]);
+  assert.match(els.get("#netease-playlist-users-note").textContent, /读取用户失败/);
+  assert.strictEqual(els.get("#netease-playlist-users-retry").disabled, false);
+});
+
+test("网易账号歌单账户范围：旧配置默认全部，空选择明确不向任何账户展示", async () => {
+  reset();
+  enqueue("/app/fnmusic-ext/api/config", {
+    schema: { FNMUSIC_NETEASE_PLAYLIST_SCOPE: {}, FNMUSIC_NETEASE_PLAYLIST_USERS: {} },
+    values: { FNMUSIC_NETEASE_MY_PLAYLISTS: "true" },
+  });
+  enqueue("/app/fnmusic-ext/api/maintenance/music-users", { ok: true, users: [] });
+  await global.loadConfig();
+  assert.strictEqual(global.collectConfig().FNMUSIC_NETEASE_PLAYLIST_SCOPE, "all");
+  els.get("#netease-playlist-scope").value = "selected";
+  await els.get("#netease-playlist-scope").dispatch("change");
+  assert.match(els.get("#netease-playlist-users-note").textContent, /不向任何账户/);
+  assert.strictEqual(global.collectConfig().FNMUSIC_NETEASE_PLAYLIST_USERS, "[]");
+});
+
 test("网易云歌单常驻开关：loadConfig 回填 + collectConfig 收集", async () => {
   reset();
   enqueue("/app/fnmusic-ext/api/config", { values: { FNMUSIC_NETEASE_PLAYLIST_RESIDENT: "true" } });

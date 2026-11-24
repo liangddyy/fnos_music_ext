@@ -61,6 +61,9 @@ let publicSelection = [];
 let publicUsers = [];
 let publicUsersReady = false;
 let publicUsersSeq = 0;
+let musicUsersLoading = false;
+let musicUsersError = "";
+let neteasePlaylistUsers = [];
 let publicUserGuid = "";
 let publicSelectionMap = {};
 const publicUserChanges = new Set();
@@ -687,7 +690,7 @@ async function loadConfig(timeoutMs = 0) {
   $("#webui-build-mismatch").hidden = !mismatch;
   applyConfigToForm();
   clearDirty();
-  if (configSchema.FNMUSIC_PUBLIC_PLAYLISTS_BY_USER) {
+  if (configSchema.FNMUSIC_PUBLIC_PLAYLISTS_BY_USER || configSchema.FNMUSIC_NETEASE_PLAYLIST_USERS) {
     try { await loadMusicUsers(); } catch (err) { console.warn("加载歌单用户列表异常", err); }
   }
   try { await loadUserStorage(); } catch (err) { console.warn("加载用户目录异常", err); }
@@ -808,6 +811,14 @@ function applyConfigToForm() {
   webLimitEl.disabled = !configSchema.FNMUSIC_WEB_SEARCH_RESULT_LIMIT;
   webLimitEl.value = v.FNMUSIC_WEB_SEARCH_RESULT_LIMIT || "50";
   $("#netease-my-playlists").checked = v.FNMUSIC_NETEASE_MY_PLAYLISTS === "true";
+  $("#netease-playlist-scope").value = v.FNMUSIC_NETEASE_PLAYLIST_SCOPE == null
+    || v.FNMUSIC_NETEASE_PLAYLIST_SCOPE === "all" ? "all" : "selected";
+  try {
+    const users = JSON.parse(v.FNMUSIC_NETEASE_PLAYLIST_USERS || "[]");
+    neteasePlaylistUsers = Array.isArray(users) && users.every((guid) => typeof guid === "string" && guid.trim() && guid !== "shared")
+      ? Array.from(new Set(users)) : [];
+  } catch (_) { neteasePlaylistUsers = []; }
+  renderNeteasePlaylistUsers();
   $("#netease-playlist-resident").checked = v.FNMUSIC_NETEASE_PLAYLIST_RESIDENT === "true";
   $("#lx-url").value = "";
   lxVerifiedUrl = null;
@@ -908,6 +919,10 @@ function collectConfig() {
     ...(configSchema.FNMUSIC_WEB_SEARCH_RESULT_LIMIT
       ? { FNMUSIC_WEB_SEARCH_RESULT_LIMIT: webSearchLimitNumber() } : {}),
     FNMUSIC_NETEASE_MY_PLAYLISTS: $("#netease-my-playlists").checked,
+    ...(configSchema.FNMUSIC_NETEASE_PLAYLIST_SCOPE ? {
+      FNMUSIC_NETEASE_PLAYLIST_SCOPE: $("#netease-playlist-scope").value,
+      FNMUSIC_NETEASE_PLAYLIST_USERS: JSON.stringify(neteasePlaylistUsers),
+    } : {}),
     FNMUSIC_NETEASE_PLAYLIST_RESIDENT: $("#netease-playlist-resident").checked,
     LX_SOURCE_LIST: JSON.stringify(lxSourceList),
   };
@@ -1451,6 +1466,45 @@ function stashPublicUser(changed = false) {
   if (changed) publicUserChanges.add(publicUserGuid);
 }
 
+function renderNeteasePlaylistUsers() {
+  const enabled = $("#netease-my-playlists").checked;
+  const supported = !!configSchema.FNMUSIC_NETEASE_PLAYLIST_SCOPE;
+  $("#netease-playlist-scope").disabled = !supported || !enabled;
+  $("#netease-playlist-accounts").hidden = !supported || !enabled || $("#netease-playlist-scope").value !== "selected";
+  $("#netease-playlist-users-retry").disabled = musicUsersLoading;
+  const users = publicUsers.slice();
+  for (const guid of neteasePlaylistUsers) {
+    if (!users.some((user) => user.guid === guid)) users.push({ guid, name: `${guid}（不在当前用户列表中）` });
+  }
+  const choices = users.map((user) => {
+    const label = document.createElement("label");
+    label.className = "chip";
+    const input = document.createElement("input");
+    input.type = "checkbox";
+    input.value = user.guid;
+    input.checked = neteasePlaylistUsers.includes(user.guid);
+    input.disabled = !enabled || !publicUsersReady;
+    label.classList.toggle("on", input.checked);
+    input.addEventListener("change", () => {
+      neteasePlaylistUsers = input.checked
+        ? Array.from(new Set([...neteasePlaylistUsers, user.guid]))
+        : neteasePlaylistUsers.filter((guid) => guid !== user.guid);
+      renderNeteasePlaylistUsers();
+      markDirty("网易歌单同步账户需保存后生效");
+    });
+    const name = document.createElement("span");
+    name.textContent = (user.name || user.guid) + (user.role === "admin" ? "（管理员）" : "");
+    label.appendChild(input);
+    label.appendChild(name);
+    return label;
+  });
+  $("#netease-playlist-users").replaceChildren(...choices);
+  $("#netease-playlist-users-note").textContent = musicUsersLoading ? "正在读取飞牛音乐用户…"
+    : musicUsersError || (neteasePlaylistUsers.length
+      ? `已选择 ${neteasePlaylistUsers.length} 个账户；未选中的账户无法读取账号歌单。`
+      : "尚未选择账户，保存后不向任何账户展示网易账号歌单。");
+}
+
 function renderMusicUsers() {
   const panel = $("#public-users-panel");
   if (!panel) return;
@@ -1478,6 +1532,9 @@ function renderMusicUsers() {
 
 async function loadMusicUsers() {
   const seq = ++publicUsersSeq;
+  musicUsersLoading = true;
+  musicUsersError = "";
+  renderNeteasePlaylistUsers();
   $("#public-users-retry").disabled = true;
   $("#public-users-note").textContent = "正在读取飞牛音乐用户…";
   try {
@@ -1510,8 +1567,11 @@ async function loadMusicUsers() {
     } else {
       $("#public-users-note").textContent = "读取用户失败：" + exc.message + "。请点击刷新用户重试。";
     }
+    musicUsersError = $("#public-users-note").textContent;
   } finally {
     if (seq === publicUsersSeq) {
+      musicUsersLoading = false;
+      renderNeteasePlaylistUsers();
       $("#public-users-retry").disabled = false;
       renderMusicUsers();
       renderPublicSelected();
@@ -2952,11 +3012,19 @@ function stopQrPolling() {
 }
 $("#qr-btn").addEventListener("click", startQrLogin);
 
+$("#netease-playlist-scope").addEventListener("change", () => {
+  renderNeteasePlaylistUsers();
+  markDirty("网易歌单同步范围需保存后生效");
+});
+$("#netease-my-playlists").addEventListener("change", renderNeteasePlaylistUsers);
+$("#netease-playlist-users-retry").addEventListener("click", loadMusicUsers);
+
 $("#netease-playlist-resident").addEventListener("change", () => {
   // 常驻为账号/公共歌单供数；仅在没有公共选择时自动带出账号歌单开关。
   const publicNeedsMusicbox = anyPublicMusicboxSelection();
   if ($("#netease-playlist-resident").checked && !$("#netease-my-playlists").checked && !publicNeedsMusicbox) {
     $("#netease-my-playlists").checked = true;
+    renderNeteasePlaylistUsers();
   }
 });
 

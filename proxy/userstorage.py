@@ -6,6 +6,21 @@ import json
 import os
 
 
+def normalize_account_users(raw) -> list[str]:
+    users = json.loads(raw) if isinstance(raw, str) else raw
+    if not isinstance(users, list):
+        raise ValueError("网易歌单账户必须是 JSON 字符串数组")
+    normalized = []
+    for guid in users:
+        if (not isinstance(guid, str) or not guid.strip() or guid.strip() == "shared"
+                or len(guid) > 256 or any(ord(char) < 32 or ord(char) == 127 for char in guid)):
+            raise ValueError("网易歌单账户必须是有效的飞牛用户 GUID")
+        guid = guid.strip()
+        if guid not in normalized:
+            normalized.append(guid)
+    return normalized
+
+
 def _guid(value: object, label: str = "用户 GUID") -> str:
     guid = str(value or "").strip()
     if not guid or guid == "shared" or len(guid) > 256:
